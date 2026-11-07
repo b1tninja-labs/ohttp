@@ -13,9 +13,9 @@ __all__ = [
 
 
 def supported_suites() -> tuple:
-    """Pending behaviour defined by RFC 9180.
+    """Pending behaviour defined by RFC 9180 sec. 7.
 
     Not implemented yet. See the ``crypto.supported_suites()`` row in ROADMAP.md; this
     stub raises on purpose so nothing downstream mistakes it for working code.
     """
-    raise NotImplementedError("supported_suites() is not implemented: RFC 9180")
+    raise NotImplementedError("supported_suites() is not implemented: RFC 9180 sec. 7")

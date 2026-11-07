@@ -15,14 +15,14 @@ import pytest
 import ohttp as package
 
 SURFACE = [
-    ("keys", "generate_config", "RFC 9458"),
-    ("keys", "parse_config", "RFC 9458"),
-    ("message", "encapsulate", "RFC 9458"),
-    ("message", "decapsulate", "RFC 9458"),
+    ("keys", "generate_config", "RFC 9458 sec. 3"),
+    ("keys", "parse_config", "RFC 9458 sec. 3.1"),
+    ("message", "encapsulate", "RFC 9458 sec. 4"),
+    ("message", "decapsulate", "RFC 9458 sec. 4"),
     ("gateway", "relay", "RFC 9458"),
-    ("client", "request", "RFC 9458"),
-    ("svcb", "select_gateway", "RFC 9540"),
-    ("crypto", "supported_suites", "RFC 9180"),
+    ("client", "request", "RFC 9458 sec. 5"),
+    ("svcb", "select_gateway", "RFC 9540 sec. 4, sec. 5"),
+    ("crypto", "supported_suites", "RFC 9180 sec. 7"),
 ]
 
 
@@ -40,7 +40,10 @@ def test_surface_is_documented(module_name, fn, cite):
     module = importlib.import_module(package.__name__ + "." + module_name)
     target = getattr(module, fn)
     assert target.__doc__, fn + " needs a docstring"
-    assert cite in target.__doc__, fn + " must cite the document that defines it"
+    # Docstrings are wrapped, so a long citation can span a line break; compare words, not layout.
+    assert " ".join(cite.split()) in " ".join(target.__doc__.split()), (
+        fn + " must cite the document that defines it"
+    )
 
 
 @pytest.mark.parametrize(("module_name", "fn", "cite"), SURFACE)

@@ -20,9 +20,9 @@ __all__ = [
 
 
 def select_gateway(records: list, now: float) -> Gateway:
-    """Pending behaviour defined by RFC 9540.
+    """Pending behaviour defined by RFC 9540 sec. 4, sec. 5.
 
     Not implemented yet. See the ``svcb.select_gateway()`` row in ROADMAP.md; this stub
     raises on purpose so nothing downstream mistakes it for working code.
     """
-    raise NotImplementedError("select_gateway() is not implemented: RFC 9540")
+    raise NotImplementedError("select_gateway() is not implemented: RFC 9540 sec. 4, sec. 5")

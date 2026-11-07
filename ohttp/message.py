@@ -24,18 +24,18 @@ __all__ = [
 
 
 def encapsulate(request: bytes, config: KeyConfig, aad: bytes) -> Encapsulated:
-    """Pending behaviour defined by RFC 9458.
+    """Pending behaviour defined by RFC 9458 sec. 4.
 
     Not implemented yet. See the ``message.encapsulate()`` row in ROADMAP.md; this stub
     raises on purpose so nothing downstream mistakes it for working code.
     """
-    raise NotImplementedError("encapsulate() is not implemented: RFC 9458")
+    raise NotImplementedError("encapsulate() is not implemented: RFC 9458 sec. 4")
 
 
 def decapsulate(body: Encapsulated, keys: ResponderKeys) -> Decapsulated:
-    """Pending behaviour defined by RFC 9458.
+    """Pending behaviour defined by RFC 9458 sec. 4.
 
     Not implemented yet. See the ``message.decapsulate()`` row in ROADMAP.md; this stub
     raises on purpose so nothing downstream mistakes it for working code.
     """
-    raise NotImplementedError("decapsulate() is not implemented: RFC 9458")
+    raise NotImplementedError("decapsulate() is not implemented: RFC 9458 sec. 4")

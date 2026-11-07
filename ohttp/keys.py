@@ -23,18 +23,18 @@ __all__ = [
 
 
 def generate_config(suite: Suite, key_id: int) -> KeyPair:
-    """Pending behaviour defined by RFC 9458.
+    """Pending behaviour defined by RFC 9458 sec. 3.
 
     Not implemented yet. See the ``keys.generate_config()`` row in ROADMAP.md; this stub
     raises on purpose so nothing downstream mistakes it for working code.
     """
-    raise NotImplementedError("generate_config() is not implemented: RFC 9458")
+    raise NotImplementedError("generate_config() is not implemented: RFC 9458 sec. 3")
 
 
 def parse_config(raw: bytes) -> KeyConfig:
-    """Pending behaviour defined by RFC 9458.
+    """Pending behaviour defined by RFC 9458 sec. 3.1.
 
     Not implemented yet. See the ``keys.parse_config()`` row in ROADMAP.md; this stub
     raises on purpose so nothing downstream mistakes it for working code.
     """
-    raise NotImplementedError("parse_config() is not implemented: RFC 9458")
+    raise NotImplementedError("parse_config() is not implemented: RFC 9458 sec. 3.1")

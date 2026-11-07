@@ -22,9 +22,9 @@ __all__ = [
 
 
 async def request(gateway: Gateway, request: HttpRequest) -> HttpResponse:
-    """Pending behaviour defined by RFC 9458.
+    """Pending behaviour defined by RFC 9458 sec. 5.
 
     Not implemented yet. See the ``client.request()`` row in ROADMAP.md; this stub raises
     on purpose so nothing downstream mistakes it for working code.
     """
-    raise NotImplementedError("request() is not implemented: RFC 9458")
+    raise NotImplementedError("request() is not implemented: RFC 9458 sec. 5")
