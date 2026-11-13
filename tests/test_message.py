@@ -265,4 +265,120 @@ def test_p256_ohttp_roundtrip_with_request_and_response():
 
 def test_supported_suites_include_p256():
     kems = {s.kem_id for s in supported_suites()}
-    assert kems == {0x0010, 0x0020}
+    assert kems == {0x0010, 0x0011, 0x0012, 0x0020}
+
+
+# RFC 9180 Appendix A.6.1: DHKEM(P-521, HKDF-SHA512), HKDF-SHA512, AES-256-GCM, base mode.
+P521 = HpkeSuite(0x0012, 3, 2)
+P521_SK_E = H(
+    "014784c692da35df6ecde98ee43ac425dbdd0969c0c72b42f2e708ab9d535415a8569bdacfcc0a114c85b8e3f26a"
+    "cf4d68115f8c91a66178cdbd03b7bcc5291e374b"
+)
+P521_PK_E = H(
+    "040138b385ca16bb0d5fa0c0665fbbd7e69e3ee29f63991d3e9b5fa740aab8900aaeed46ed73a49055758425a0ce"
+    "36507c54b29cc5b85a5cee6bae0cf1c21f2731ece2013dc3fb7c8d21654bb161b463962ca19e8c654ff24c94dd28"
+    "98de12051f1ed0692237fb02b2f8d1dc1c73e9b366b529eb436e98a996ee522aef863dd5739d2f29b0"
+)
+P521_SK_R = H(
+    "01462680369ae375e4b3791070a7458ed527842f6a98a79ff5e0d4cbde83c27196a3916956655523a6a2556a7af6"
+    "2c5cadabe2ef9da3760bb21e005202f7b2462847"
+)
+P521_PK_R = H(
+    "0401b45498c1714e2dce167d3caf162e45e0642afc7ed435df7902ccae0e84ba0f7d373f646b7738bbbdca11ed91"
+    "bdeae3cdcba3301f2457be452f271fa6837580e661012af49583a62e48d44bed350c7118c0d8dc861c238c72a2bd"
+    "a17f64704f464b57338e7f40b60959480c0e58e6559b190d81663ed816e523b6b6a418f66d2451ec64"
+)
+P521_CT0 = H(
+    "170f8beddfe949b75ef9c387e201baf4132fa7374593dfafa90768788b7b2b200aafcc6d80ea4c795a7c5b841a"
+)
+P521_CT1 = H(
+    "d9ee248e220ca24ac00bbbe7e221a832e4f7fa64c4fbab3945b6f3af0c5ecd5e16815b328be4954a05fd352256"
+)
+
+
+def test_hpke_rfc9180_appendix_a_p521():
+    # the vector uses the KEM's own SHA-512 (kem 0x0012) and a 66-octet private scalar
+    assert len(P521_SK_E) == len(P521_SK_R) == 66
+    enc, sender = setup_base_s(P521, P521_PK_R, HPKE_INFO, ephemeral_sk=P521_SK_E)
+    assert enc == P521_PK_E
+    assert sender.seal(b"Count-0", HPKE_PT) == P521_CT0
+    assert sender.seal(b"Count-1", HPKE_PT) == P521_CT1
+    assert sender.export(b"", 32).hex() == (
+        "05e2e5bd9f0c30832b80a279ff211cc65eceb0d97001524085d609ead60d0412"
+    )
+    assert sender.export(b"\x00", 32).hex() == (
+        "fca69744bb537f5b7a1596dbf34eaa8d84bf2e3ee7f1a155d41bd3624aa92b63"
+    )
+    receiver = setup_base_r(P521, P521_PK_E, P521_SK_R, HPKE_INFO)
+    assert receiver.open(b"Count-0", P521_CT0) == HPKE_PT
+    assert receiver.open(b"Count-1", P521_CT1) == HPKE_PT
+
+
+def test_p384_and_p521_key_lengths_and_refusals():
+    from ohttp.crypto import KEMS, generate_keypair
+
+    for kem_id, (nsk, npk) in {0x0011: (48, 97), 0x0012: (66, 133)}.items():
+        assert (KEMS[kem_id].nsk, KEMS[kem_id].npk, KEMS[kem_id].nenc) == (nsk, npk, npk)
+        private, public = generate_keypair(kem_id)
+        assert (len(private), len(public)) == (nsk, npk)
+        suite = HpkeSuite(kem_id, 2, 2)
+        enc, _ = setup_base_s(suite, public, b"")
+        for bad in (
+            public[:-1],  # short
+            b"\x02" + public[1 : 1 + (npk - 1) // 2],  # compressed form (sec. 7.1.1)
+            public[:-1] + bytes([public[-1] ^ 1]),  # off the curve
+            bytes(npk),  # all zero is not a point
+            public + b"\x00",  # long
+        ):
+            with pytest.raises(MessageError):
+                setup_base_s(suite, bad, b"")
+            with pytest.raises(MessageError):
+                setup_base_r(suite, bad, private, b"")
+        for sk in (bytes(nsk), b"\xff" * nsk, private[:-1]):  # zero, above the order, short
+            with pytest.raises(MessageError):
+                setup_base_r(suite, enc, sk, b"")
+
+
+def test_p384_hpke_round_trip_and_kem_hash():
+    import hashlib
+    import hmac
+
+    from ohttp.crypto import KEMS, generate_keypair
+
+    # P-384 has no printed RFC 9180 vector. Each ciphersuite KDF and AEAD must still agree
+    # between the roles, and the encapsulation must use HKDF-SHA384 whatever the suite KDF is.
+    private, public = generate_keypair(0x0011)
+    for kdf in (1, 2, 3):
+        for aead in (1, 2, 3):
+            suite = HpkeSuite(0x0011, kdf, aead)
+            enc, sender = setup_base_s(suite, public, HPKE_INFO)
+            receiver = setup_base_r(suite, enc, private, HPKE_INFO)
+            assert receiver.open(b"aad", sender.seal(b"aad", HPKE_PT)) == HPKE_PT
+            assert receiver.export(b"x", 24) == sender.export(b"x", 24)
+    # an independent derivation of sec. 4.1 ExtractAndExpand with SHA-384 matches the shared secret
+    from ohttp.crypto import _dh, _kem_shared_secret, _public
+
+    eph, eph_pub = generate_keypair(0x0011)
+    dh = _dh(0x0011, eph, public)
+    context = _public(0x0011, eph) + public
+    suite_id = b"KEM" + (0x0011).to_bytes(2, "big")
+    prk = hmac.new(b"\x00" * 48, b"HPKE-v1" + suite_id + b"eae_prk" + dh, hashlib.sha384).digest()
+    label = (48).to_bytes(2, "big") + b"HPKE-v1" + suite_id + b"shared_secret" + context
+    expected = hmac.new(prk, label + b"\x01", hashlib.sha384).digest()  # one block: T(1)
+    assert KEMS[0x0011].nsecret == 48 == len(expected)
+    assert _kem_shared_secret(0x0011, dh, context) == expected
+    assert eph_pub == context[:97]
+
+
+def test_p384_and_p521_ohttp_roundtrip():
+    suites = (SymmetricSuite(1, 1), SymmetricSuite(2, 2), SymmetricSuite(3, 3))
+    for kem_id, npk in ((0x0011, 97), (0x0012, 133)):
+        pair = generate_config(suites, 9, kem_id=kem_id)
+        assert len(pair.config.public_key) == npk
+        for suite in suites:
+            encapsulated = encapsulate(REQUEST, pair.config, suite=suite)
+            assert encapsulated.body[1:3] == kem_id.to_bytes(2, "big")
+            opened = decapsulate(encapsulated.body, [pair])
+            assert opened.request == REQUEST
+            response = encapsulate_response(opened.context, RESPONSE)
+            assert decapsulate_response(encapsulated.context, response) == RESPONSE

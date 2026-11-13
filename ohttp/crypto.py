@@ -7,16 +7,21 @@ response, and Appendix A can be checked only with a caller-chosen ephemeral key.
 schedule here is written out from RFC 9180 sec. 4, sec. 5.1 and sec. 5.3, and takes from
 ``cryptography`` only X25519, HKDF-Expand and the AEADs.
 
-Implemented: mode_base, DHKEM(X25519, HKDF-SHA256) (kem 0x0020) and DHKEM(P-256, HKDF-SHA256)
-(kem 0x0010, RFC 9180 appendix A.3 vectors), HKDF-SHA256/384/512 (kdf 0x0001..0x0003),
-AES-128-GCM, AES-256-GCM and ChaCha20Poly1305 (aead 0x0001..0x0003). The P-384, P-521 and X448
-KEMs, and the PSK and Auth modes, are not.
+Implemented: mode_base, DHKEM(X25519, HKDF-SHA256) (kem 0x0020), DHKEM(P-256, HKDF-SHA256)
+(kem 0x0010, RFC 9180 appendix A.3 vectors), DHKEM(P-384, HKDF-SHA384) (kem 0x0011) and
+DHKEM(P-521, HKDF-SHA512) (kem 0x0012, appendix A.6 vector), HKDF-SHA256/384/512 (kdf
+0x0001..0x0003), AES-128-GCM, AES-256-GCM and ChaCha20Poly1305 (aead 0x0001..0x0003). The X448
+KEM, and the PSK and Auth modes, are not.
 
-P-256 follows RFC 9180 sec. 7.1: public keys are the uncompressed SEC1 point (65 octets;
-compressed or malformed points are refused, which is the partial validation of sec. 7.1.4),
-private keys are the 32-octet big-endian scalar and must lie in [1, order-1], and the
-Diffie-Hellman output is the x coordinate. The scalar is not reduced as sec. 7.1.2 allows;
-a value outside the range is refused instead, so two implementations cannot disagree on it.
+The NIST curves follow RFC 9180 sec. 7.1: public keys are the uncompressed SEC1 point (65, 97
+or 133 octets; compressed or malformed points are refused, which is the partial validation of
+sec. 7.1.4), private keys are the big-endian scalar of Nsk octets (32, 48 or 66) and must lie
+in [1, order-1], and the Diffie-Hellman output is the x coordinate. The scalar is not reduced
+as sec. 7.1.2 allows; a value outside the range is refused instead, so two implementations
+cannot disagree on it. Each KEM runs its own KDF inside the encapsulation (sec. 7.1.3:
+SHA-256, SHA-384 or SHA-512), whatever the ciphersuite's KDF is. RFC 9180 has no printed
+vector for P-384, so that KEM is checked by round trips, by the curve and length tables, and
+by the P-521 vector exercising the same code path.
 """
 
 from __future__ import annotations
@@ -56,6 +61,8 @@ __all__ = [
 
 KEM_X25519 = 0x0020
 KEM_P256 = 0x0010
+KEM_P384 = 0x0011
+KEM_P521 = 0x0012
 _MODE_BASE = b"\x00"  # RFC 9180 sec. 5 Table 1
 
 
@@ -68,15 +75,22 @@ class _Kdf:
 
 @dataclass(frozen=True)
 class _Kem:
-    """One row of RFC 9180 sec. 7.1 Table 2 (the KEM's own KDF is always HKDF-SHA256 here)."""
+    """One row of RFC 9180 sec. 7.1 Table 2, with the hash of the KEM's own HKDF."""
 
     nsecret: int
     nenc: int
     npk: int
     nsk: int
+    kdf_id: int  # the KEM's associated KDF (sec. 7.1.3), not the ciphersuite's
+    curve: type[ec.EllipticCurve] | None = None  # None for X25519
 
 
-KEMS: dict[int, _Kem] = {KEM_X25519: _Kem(32, 32, 32, 32), KEM_P256: _Kem(32, 65, 65, 32)}
+KEMS: dict[int, _Kem] = {
+    KEM_X25519: _Kem(32, 32, 32, 32, 0x0001),
+    KEM_P256: _Kem(32, 65, 65, 32, 0x0001, ec.SECP256R1),
+    KEM_P384: _Kem(48, 97, 97, 48, 0x0002, ec.SECP384R1),
+    KEM_P521: _Kem(64, 133, 133, 66, 0x0003, ec.SECP521R1),
+}
 
 # RFC 9180 sec. 7.2 Table 3.
 KDFS: dict[int, _Kdf] = {
@@ -128,39 +142,50 @@ def _clamp(sk: bytes) -> bytes:
 
 def generate_keypair(kem_id: int = KEM_X25519) -> tuple[bytes, bytes]:
     """Return ``(private, public)`` for the KEM, the private key serialised as RFC 9180 says."""
-    if kem_id == KEM_X25519:
-        private = _clamp(os.urandom(32))
-    elif kem_id == KEM_P256:
-        key = ec.generate_private_key(ec.SECP256R1())
-        private = key.private_numbers().private_value.to_bytes(32, "big")
-    else:
+    kem = KEMS.get(kem_id)
+    if kem is None:
         raise NotImplementedError(f"KEM {kem_id:#06x} is not implemented")
+    if kem.curve is None:
+        private = _clamp(os.urandom(32))
+    else:
+        key = ec.generate_private_key(kem.curve())
+        private = key.private_numbers().private_value.to_bytes(kem.nsk, "big")
     return private, _public(kem_id, private)
 
 
-def _p256_private(private: bytes) -> ec.EllipticCurvePrivateKey:
-    if len(private) != 32:
-        raise MessageError("a P-256 private key is 32 bytes")
+def _ec_curve(kem_id: int) -> tuple[_Kem, ec.EllipticCurve]:
+    kem = KEMS[kem_id]
+    if kem.curve is None:
+        raise MessageError("not an elliptic-curve KEM")
+    return kem, kem.curve()
+
+
+def _ec_private(kem_id: int, private: bytes) -> ec.EllipticCurvePrivateKey:
+    kem, curve = _ec_curve(kem_id)
+    name = curve.name
+    if len(private) != kem.nsk:
+        raise MessageError(f"a {name} private key is {kem.nsk} bytes")
     try:
-        return ec.derive_private_key(int.from_bytes(private, "big"), ec.SECP256R1())
+        return ec.derive_private_key(int.from_bytes(private, "big"), curve)
     except ValueError:
-        raise MessageError("P-256 private key is outside [1, order-1]") from None
+        raise MessageError(f"{name} private key is outside [1, order-1]") from None
 
 
-def _p256_public(public: bytes) -> ec.EllipticCurvePublicKey:
+def _ec_public(kem_id: int, public: bytes) -> ec.EllipticCurvePublicKey:
     # RFC 9180 sec. 7.1.1: uncompressed only; sec. 7.1.4: on the curve, not the point at infinity.
-    if len(public) != 65 or public[0] != 4:
-        raise MessageError("a P-256 public key is a 65-byte uncompressed point")
+    kem, curve = _ec_curve(kem_id)
+    if len(public) != kem.npk or public[0] != 4:
+        raise MessageError(f"a {curve.name} public key is a {kem.npk}-byte uncompressed point")
     try:
-        return ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), public)
+        return ec.EllipticCurvePublicKey.from_encoded_point(curve, public)
     except ValueError:
-        raise MessageError("P-256 public key is not a point on the curve") from None
+        raise MessageError(f"{curve.name} public key is not a point on the curve") from None
 
 
 def _public(kem_id: int, private: bytes) -> bytes:
-    if kem_id == KEM_P256:
+    if KEMS[kem_id].curve is not None:
         return (
-            _p256_private(private)
+            _ec_private(kem_id, private)
             .public_key()
             .public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
         )
@@ -168,8 +193,8 @@ def _public(kem_id: int, private: bytes) -> bytes:
 
 
 def _dh(kem_id: int, private: bytes, public: bytes) -> bytes:
-    if kem_id == KEM_P256:
-        return _p256_private(private).exchange(ec.ECDH(), _p256_public(public))
+    if KEMS[kem_id].curve is not None:
+        return _ec_private(kem_id, private).exchange(ec.ECDH(), _ec_public(kem_id, public))
     if len(public) != 32:
         raise MessageError("an X25519 public key is 32 bytes")
     try:
@@ -221,7 +246,7 @@ def _labeled_expand(
 
 
 def _kem_shared_secret(kem_id: int, dh: bytes, kem_context: bytes) -> bytes:
-    kdf = KDFS[0x0001]  # both implemented KEMs use HKDF-SHA256
+    kdf = KDFS[KEMS[kem_id].kdf_id]  # sec. 7.1: the KEM's own HKDF hash
     suite_id = b"KEM" + kem_id.to_bytes(2, "big")
     eae_prk = _labeled_extract(kdf, suite_id, b"", b"eae_prk", dh)
     return _labeled_expand(

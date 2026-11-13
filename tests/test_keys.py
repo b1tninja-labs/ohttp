@@ -102,7 +102,7 @@ def test_generate_config():
     assert pair.private_key[0] & 7 == 0
     assert pair.private_key[31] & 0xC0 == 0x40  # clamped (RFC 9180 sec. 7.1.2, erratum 7121)
     with pytest.raises(NotImplementedError):
-        generate_config(suites, 1, kem_id=0x0011)  # P-384 is not implemented
+        generate_config(suites, 1, kem_id=0x0021)  # X448 is not implemented
     p256 = generate_config(suites, 1, kem_id=0x0010)
     assert len(p256.config.public_key) == 65
     assert p256.config.public_key[0] == 4

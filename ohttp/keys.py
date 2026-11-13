@@ -166,8 +166,8 @@ def generate_config(
 ) -> KeyPair:
     """Generate a key pair and its key configuration, RFC 9458 sec. 3.
 
-    DHKEM(X25519, HKDF-SHA256) (0x0020) and DHKEM(P-256, HKDF-SHA256) (0x0010) are implemented. An X25519 private key is serialised
-    clamped, as RFC 9180 sec. 7.1.2 requires and its erratum 7121 explains.
+    DHKEM(X25519, HKDF-SHA256) (0x0020) and the NIST curves 0x0010 (P-256), 0x0011 (P-384) and 0x0012
+    (P-521) are implemented. An X25519 private key is serialised clamped, as RFC 9180 sec. 7.1.2 requires and its erratum 7121 explains.
     """
     private, public = generate_keypair(kem_id)
     return KeyPair(KeyConfig(key_id, kem_id, public, tuple(suites)), private)
