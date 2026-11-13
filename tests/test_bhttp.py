@@ -12,6 +12,7 @@ from ohttp.bhttp import (
     decode_response,
     encode_request,
     encode_response,
+    padded_length,
 )
 from ohttp.errors import BhttpError
 
@@ -118,9 +119,9 @@ def test_framing_indicator_mismatch_and_indeterminate():
         decode_response(APPENDIX_A_REQUEST)
     with pytest.raises(BhttpError):
         decode_request(b"\x04")
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(BhttpError):
         decode_request(b"\x02")
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(BhttpError):
         decode_response(b"\x03")
 
 
@@ -176,3 +177,133 @@ def test_request_roundtrip_with_everything():
         ((b"x-trailer", b"1"),),
     )
     assert decode_request(encode_request(request)) == request
+
+
+# RFC 9292 sec. 5.1 Figure 9 (indeterminate-length request, 10 octets of padding).
+FIG9 = bytes.fromhex(
+    "02034745 54056874 74707300 0a2f6865 6c6c6f2e 7478740a 75736572 2d616765"
+    "6e743463 75726c2f 372e3136 2e33206c 69626375 726c2f37 2e31362e 33204f70"
+    "656e5353 4c2f302e 392e376c 207a6c69 622f312e 322e3304 686f7374 0f777777"
+    "2e657861 6d706c65 2e636f6d 0f616363 6570742d 6c616e67 75616765 06656e2c"
+    "206d6900 00000000 00000000 00000000"
+)
+# RFC 9292 sec. 5.2 Figure 11 (indeterminate-length response with 102 and 103 before the 200).
+FIG11 = bytes.fromhex(
+    "03406607 72756e6e 696e670a 22736c65 65702031 35220040 67046c69 6e6b233c"
+    "2f737479 6c652e63 73733e3b 2072656c 3d707265 6c6f6164 3b206173 3d737479"
+    "6c65046c 696e6b24 3c2f7363 72697074 2e6a733e 3b207265 6c3d7072 656c6f61"
+    "643b2061 733d7363 72697074 0040c804 64617465 1d4d6f6e 2c203237 204a756c"
+    "20323030 39203132 3a32383a 35332047 4d540673 65727665 72064170 61636865"
+    "0d6c6173 742d6d6f 64696669 65641d57 65642c20 3232204a 756c2032 30303920"
+    "31393a31 353a3536 20474d54 04657461 67142233 34616133 38372d64 2d313536"
+    "38656230 30220d61 63636570 742d7261 6e676573 05627974 65730e63 6f6e7465"
+    "6e742d6c 656e6774 68023531 04766172 790f4163 63657074 2d456e63 6f64696e"
+    "670c636f 6e74656e 742d7479 70650a74 6578742f 706c6169 6e003348 656c6c6f"
+    "20576f72 6c642120 4d792063 6f6e7465 6e742069 6e636c75 64657320 61207472"
+    "61696c69 6e672043 524c462e 0d0a0000"
+)
+FIG11_RESPONSE = Response(
+    200,
+    headers=(
+        (b"date", b"Mon, 27 Jul 2009 12:28:53 GMT"),
+        (b"server", b"Apache"),
+        (b"last-modified", b"Wed, 22 Jul 2009 19:15:56 GMT"),
+        (b"etag", b'"34aa387-d-1568eb00"'),
+        (b"accept-ranges", b"bytes"),
+        (b"content-length", b"51"),
+        (b"vary", b"Accept-Encoding"),
+        (b"content-type", b"text/plain"),
+    ),
+    content=b"Hello World! My content includes a trailing CRLF.\r\n",
+    informational=(
+        (102, ((b"running", b'"sleep 15"'),)),
+        (
+            103,
+            (
+                (b"link", b"</style.css>; rel=preload; as=style"),
+                (b"link", b"</script.js>; rel=preload; as=script"),
+            ),
+        ),
+    ),
+)
+
+
+def test_rfc9292_indeterminate_examples():
+    request = decode_request(FIG9)
+    assert request == decode_request(FIG8)  # the same message in the two framings
+    assert request.method == b"GET"
+    assert request.content == b""
+    assert request.trailers == ()
+    assert len(FIG9) == 144
+    assert encode_request(request, indeterminate=True, pad_to=len(FIG9)) == FIG9
+    # sec. 5.1 para 10: up to 12 octets (10 of padding and the two trailing terminators) may go
+    assert decode_request(FIG9[:-12]) == request
+    with pytest.raises(BhttpError):
+        decode_request(FIG9[:-13])  # inside the header section: not a legal truncation point
+    response = decode_response(FIG11)
+    assert response == FIG11_RESPONSE
+    assert encode_response(FIG11_RESPONSE, indeterminate=True) == FIG11
+    assert decode_response(FIG13).trailers == ((b"trailer", b"text"),)
+    assert decode_response(encode_response(decode_response(FIG13), indeterminate=True)) == (
+        decode_response(FIG13)
+    )
+
+
+def test_indeterminate_chunks_are_not_kept_and_zero_length_chunk_ends_content():
+    request = Request(b"POST", b"https", b"example.com", b"/", content=b"abcdefghij")
+    one = encode_request(request, indeterminate=True)
+    three = encode_request(request, indeterminate=True, chunk_size=4)
+    assert one != three
+    assert decode_request(one) == decode_request(three) == request
+    assert three.endswith(
+        b"\x04abcd\x04efgh\x02ij\x00\x00"
+    )  # content terminator, then the trailers
+    # a trailer section after chunked content
+    with_trailer = Request(b"POST", b"https", b"h", b"/", content=b"xyz", trailers=((b"t", b"1"),))
+    assert decode_request(encode_request(with_trailer, indeterminate=True, chunk_size=1)) == (
+        with_trailer
+    )
+
+
+def test_indeterminate_hostile_input():
+    head = b"\x02\x03GET\x05https\x01h\x01/"
+    good = head + b"\x00\x00\x00"
+    assert decode_request(good).method == b"GET"
+    for bad in (
+        head + b"\x01a\x01b",  # a header section with no terminator
+        head + b"\x00\x05ab",  # a chunk longer than the data
+        head + b"\x00\x01a",  # chunked content with no terminator
+        head + b"\x00\x00\x01",  # padding that is not zero
+        head + b"\x01A\x01b\x00\x00\x00",  # an uppercase field name
+        head + b"\x00\x00\x07:status\x01x\x00",  # a pseudo-field in the trailers
+        head + b"\x03abc\xff\xff\xff\xff\xff\xff\xff\xff",  # a 2**62-1 length is refused, not read
+    ):
+        with pytest.raises(BhttpError):
+            decode_request(bad)
+    # known-length messages may not carry the indeterminate terminator shape by accident
+    assert decode_request(APPENDIX_A_REQUEST) == decode_request(
+        encode_request(decode_request(APPENDIX_A_REQUEST), indeterminate=True)
+    )
+
+
+def test_pad_to_bucket():
+    assert [padded_length(n, (64, 256, 1024)) for n in (1, 64, 65, 256, 1024)] == [
+        64,
+        64,
+        256,
+        256,
+        1024,
+    ]
+    assert padded_length(1025, (64, 256, 1024)) == 2048  # past the last bucket: its multiples
+    assert padded_length(5, (8,)) == 8
+    with pytest.raises(ValueError, match="positive"):
+        padded_length(1, ())
+    with pytest.raises(ValueError, match="positive"):
+        padded_length(1, (0, 8))
+    # every message under the policy encodes to its bucket size and decodes unchanged
+    for body in (b"", b"x" * 40, b"y" * 100, b"z" * 300):
+        request = Request(b"POST", b"https", b"example.com", b"/", content=body)
+        bare = encode_request(request, truncate=True)
+        padded = encode_request(request, pad_to=padded_length(len(bare), (128, 512)))
+        assert len(padded) == padded_length(len(padded), (128, 512))
+        assert decode_request(padded) == request

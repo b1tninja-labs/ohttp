@@ -1,12 +1,13 @@
 """key configurations, identifier, generation and rotation (RFC 9458).
 
 ``parse_config`` and ``encode_config`` are a pure codec for RFC 9458 sec. 3.1 and
-``parse_config_list`` for the ``application/ohttp-keys`` collection of sec. 3.2. Rotation
-(``ROADMAP.md`` M4) is not built; nothing here pretends otherwise.
+``parse_config_list`` for the ``application/ohttp-keys`` collection of sec. 3.2. ``KeyRing``
+holds a gateway's keys through rotation (sec. 6.4, sec. 6.6) as pure state.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .crypto import generate_keypair
@@ -16,6 +17,8 @@ __all__ = [
     "KEM_PUBLIC_KEY_LENGTH",
     "KeyConfig",
     "KeyPair",
+    "KeyRing",
+    "RotationEvent",
     "SymmetricSuite",
     "encode_config",
     "encode_config_list",
@@ -163,8 +166,100 @@ def generate_config(
 ) -> KeyPair:
     """Generate a key pair and its key configuration, RFC 9458 sec. 3.
 
-    Only DHKEM(X25519, HKDF-SHA256) (0x0020) is implemented. The private key is serialised
+    DHKEM(X25519, HKDF-SHA256) (0x0020) and DHKEM(P-256, HKDF-SHA256) (0x0010) are implemented. An X25519 private key is serialised
     clamped, as RFC 9180 sec. 7.1.2 requires and its erratum 7121 explains.
     """
     private, public = generate_keypair(kem_id)
     return KeyPair(KeyConfig(key_id, kem_id, public, tuple(suites)), private)
+
+
+@dataclass(frozen=True)
+class RotationEvent:
+    """What a :class:`KeyRing` tells a listener: ``kind`` is added, retired or expired."""
+
+    kind: str
+    key_id: int
+    at: float
+
+
+class KeyRing:
+    """A gateway's keys over time: publish the current ones, accept the retired ones for a while.
+
+    RFC 9458 sec. 6.4 asks a gateway to have a plan for replacing keys, with new key identifiers;
+    a request naming an unknown or replaced key identifier is answered 422 (the gateway module
+    does that). Sec. 6.6 gives forward secrecy only by generating a new configuration and then
+    deleting the old keys after a suitable period, which :meth:`expire` does and reports so the
+    caller can delete the secret from wherever else it kept it.
+
+    Pure state: time is whatever ``now`` the caller passes, in seconds. Policies, each pinned by
+    a test: a retired key still opens requests for ``grace`` seconds (clients holding the old
+    configuration are not cut off at once); it is never published again; an identifier in use
+    cannot be reused, and :meth:`next_key_id` skips identifiers still held (the identifier is
+    one octet, so 256 keys is the hard limit).
+    """
+
+    def __init__(self, *, grace: float = 3600.0) -> None:
+        if grace < 0:
+            raise ValueError("grace cannot be negative")
+        self.grace = grace
+        self._current: dict[int, KeyPair] = {}
+        self._retired: dict[int, tuple[KeyPair, float]] = {}
+        self._listeners: list[Callable[[RotationEvent], None]] = []
+        self._last_id = -1
+
+    def subscribe(self, listener: Callable[[RotationEvent], None]) -> Callable[[], None]:
+        """Call ``listener`` on every change; the returned function removes it."""
+        self._listeners.append(listener)
+        return lambda: self._listeners.remove(listener)
+
+    def _emit(self, kind: str, key_id: int, now: float) -> None:
+        event = RotationEvent(kind, key_id, now)
+        for listener in list(self._listeners):
+            listener(event)
+
+    def next_key_id(self) -> int:
+        """An identifier not held by any current or retired key, counting on from the last."""
+        used = self._current.keys() | self._retired.keys()
+        for step in range(1, 257):
+            candidate = (self._last_id + step) % 256
+            if candidate not in used:
+                return candidate
+        raise KeyConfigError("all 256 key identifiers are in use")
+
+    def add(self, pair: KeyPair, now: float) -> None:
+        """Start publishing ``pair``; its identifier must not be held already."""
+        key_id = pair.config.key_id
+        if key_id in self._current or key_id in self._retired:
+            raise KeyConfigError(f"key identifier {key_id} is in use")
+        self._current[key_id] = pair
+        self._last_id = key_id
+        self._emit("added", key_id, now)
+
+    def rotate(self, new: KeyPair, now: float) -> None:
+        """Publish ``new`` and retire every key that was current, to be dropped after ``grace``."""
+        self.add(new, now)
+        for key_id in [k for k in self._current if k != new.config.key_id]:
+            self._retired[key_id] = (self._current.pop(key_id), now + self.grace)
+            self._emit("retired", key_id, now)
+
+    def expire(self, now: float) -> list[KeyPair]:
+        """Drop retired keys whose grace has run out and return them (RFC 9458 sec. 6.6)."""
+        gone = [k for k, (_, until) in self._retired.items() if now >= until]
+        dropped = [self._retired.pop(k)[0] for k in gone]
+        for key_id in gone:
+            self._emit("expired", key_id, now)
+        return dropped
+
+    def current(self) -> list[KeyPair]:
+        """The keys to publish in the key configuration collection."""
+        return list(self._current.values())
+
+    def decapsulation_keys(self, now: float) -> list[KeyPair]:
+        """The keys that may open a request at ``now``: current, then retired within grace."""
+        keys = list(self._current.values())
+        keys += [pair for pair, until in self._retired.values() if now < until]
+        return keys
+
+    def config_list(self) -> bytes:
+        """The ``application/ohttp-keys`` body for the current keys (RFC 9458 sec. 3.2)."""
+        return encode_config_list([pair.config for pair in self._current.values()])

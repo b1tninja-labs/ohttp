@@ -184,3 +184,85 @@ def test_all_zero_dh_refused():
     # A low-order point as enc makes the X25519 output all zero (RFC 9180 sec. 7.1.4).
     with pytest.raises(MessageError):
         setup_base_r(HpkeSuite(0x0020, 1, 1), bytes(32), GATEWAY_SK, b"")
+
+
+# RFC 9180 Appendix A.3.1: DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-128-GCM, base mode.
+P256 = HpkeSuite(0x0010, 1, 1)
+P256_SK_E = H("4995788ef4b9d6132b249ce59a77281493eb39af373d236a1fe415cb0c2d7beb")
+P256_PK_E = H(
+    "04a92719c6195d5085104f469a8b9814d5838ff72b60501e2c4466e5e67b32"
+    "5ac98536d7b61a1af4b78e5b7f951c0900be863c403ce65c9bfcb9382657222d18c4"
+)
+P256_SK_R = H("f3ce7fdae57e1a310d87f1ebbde6f328be0a99cdbcadf4d6589cf29de4b8ffd2")
+P256_PK_R = H(
+    "04fe8c19ce0905191ebc298a9245792531f26f0cece2460639e8bc39cb7f70"
+    "6a826a779b4cf969b8a0e539c7f62fb3d30ad6aa8f80e30f1d128aafd68a2ce72ea0"
+)
+P256_CT0 = H(
+    "5ad590bb8baa577f8619db35a36311226a896e7342a6d836d8b7bcd2f20b6c7f9076ac232e3ab2523f39513434"
+)
+P256_CT1 = H(
+    "fa6f037b47fc21826b610172ca9637e82d6e5801eb31cbd3748271affd4ecb06646e0329cbdf3c3cd655b28e82"
+)
+
+
+def test_hpke_rfc9180_appendix_a_p256():
+    enc, sender = setup_base_s(P256, P256_PK_R, HPKE_INFO, ephemeral_sk=P256_SK_E)
+    assert enc == P256_PK_E
+    assert sender.seal(b"Count-0", HPKE_PT) == P256_CT0
+    assert sender.seal(b"Count-1", HPKE_PT) == P256_CT1
+    assert sender.export(b"", 32).hex() == (
+        "5e9bc3d236e1911d95e65b576a8a86d478fb827e8bdfe77b741b289890490d4d"
+    )
+    assert sender.export(b"\x00", 32).hex() == (
+        "6cff87658931bda83dc857e6353efe4987a201b849658d9b047aab4cf216e796"
+    )
+    receiver = setup_base_r(P256, P256_PK_E, P256_SK_R, HPKE_INFO)
+    assert receiver.open(b"Count-0", P256_CT0) == HPKE_PT
+    assert receiver.open(b"Count-1", P256_CT1) == HPKE_PT
+
+
+def test_p256_refuses_bad_keys():
+    for bad in (
+        P256_PK_E[:-1],  # short
+        b"\x02" + P256_PK_E[1:33],  # compressed form is not allowed by sec. 7.1.1
+        P256_PK_E[:-1] + bytes([P256_PK_E[-1] ^ 1]),  # off the curve
+        bytes(65),  # not a point
+    ):
+        with pytest.raises(MessageError):
+            setup_base_r(P256, bad, P256_SK_R, HPKE_INFO)
+    with pytest.raises(MessageError):
+        setup_base_s(P256, P256_PK_E[:-1], HPKE_INFO)
+    for sk in (bytes(32), b"\xff" * 32, b"\x01" * 31):  # zero, above the order, short
+        with pytest.raises(MessageError):
+            setup_base_r(P256, P256_PK_E, sk, HPKE_INFO)
+
+
+def test_p256_ohttp_roundtrip_with_request_and_response():
+    suites = (SymmetricSuite(1, 1), SymmetricSuite(2, 2), SymmetricSuite(3, 3))
+    pair = generate_config(suites, 7, kem_id=0x0010)
+    assert len(pair.config.public_key) == 65
+    assert parse_config(
+        __import__("ohttp.keys", fromlist=["encode_config"]).encode_config(pair.config)
+    ) == (pair.config)
+    for suite in suites:
+        encapsulated = encapsulate(REQUEST, pair.config, suite=suite)
+        assert encapsulated.body[1:3] == b"\x00\x10"  # the KEM id in the header
+        opened = decapsulate(encapsulated.body, [pair])
+        assert opened.request == REQUEST
+        response = encapsulate_response(opened.context, RESPONSE)
+        assert decapsulate_response(encapsulated.context, response) == RESPONSE
+    # a key identifier bound to P-256 does not open an X25519 message, and the reverse
+    other = generate_config(suites, 7)
+    x25519 = encapsulate(REQUEST, other.config)
+    with pytest.raises(MessageError, match="KEM"):
+        decapsulate(x25519.body, [pair])
+    # truncation inside the 65-byte enc is refused cleanly
+    body = encapsulate(REQUEST, pair.config).body
+    with pytest.raises(MessageError):
+        decapsulate(body[: 7 + 64], [pair])
+
+
+def test_supported_suites_include_p256():
+    kems = {s.kem_id for s in supported_suites()}
+    assert kems == {0x0010, 0x0020}

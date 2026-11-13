@@ -17,6 +17,7 @@ from cryptography.exceptions import InvalidTag
 from .crypto import (
     AEADS,
     KDFS,
+    KEMS,
     HpkeSuite,
     ReceiverContext,
     SenderContext,
@@ -26,7 +27,7 @@ from .crypto import (
     setup_base_r,
     setup_base_s,
 )
-from .errors import MessageError
+from .errors import MessageError, UnknownKeyError
 from .keys import KeyConfig, KeyPair, SymmetricSuite
 
 __all__ = [
@@ -136,12 +137,12 @@ def decapsulate(body: bytes, keys: Sequence[KeyPair]) -> Decapsulated:
     )
     pair = next((k for k in keys if k.config.key_id == key_id), None)
     if pair is None:
-        raise MessageError("no key for this key identifier")
+        raise UnknownKeyError("no key for this key identifier")
     if pair.config.kem_id != suite.kem_id:
         raise MessageError("key identifier does not match the KEM (RFC 9458 sec. 4.3 step 1a)")
     if SymmetricSuite(suite.kdf_id, suite.aead_id) not in pair.config.suites:
         raise MessageError("KDF and AEAD not offered for this key (RFC 9458 sec. 4.3 step 1b)")
-    enc_end = _HEADER_LENGTH + 32  # Nenc of DHKEM(X25519, HKDF-SHA256)
+    enc_end = _HEADER_LENGTH + KEMS[suite.kem_id].nenc  # Nenc, RFC 9180 sec. 7.1 Table 2
     if len(data) < enc_end:
         raise MessageError("encapsulated request is shorter than its encapsulated key")
     enc = data[_HEADER_LENGTH:enc_end]

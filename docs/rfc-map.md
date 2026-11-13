@@ -36,6 +36,8 @@ Re-verify with the RFC library rather than memory: `info('RFCnnnn')` for current
 
 ## Where the cryptographic primitives come from
 
+Reads of 2026-11-13: RFC 9292 sec. 3.2 to 3.8 and sec. 5 (indeterminate length; Figures 9 and 11 are test vectors), RFC 9458 sec. 4.5, sec. 5 (5.1 to 5.3), sec. 6 (in full), sec. 9.1 to 9.3, RFC 9180 sec. 7.1 and appendix A.3 (the P-256 vector). RFC 9458 has 1 erratum on file (7781, reported), RFC 9292 1 (8559, held), RFC 9180 6 verified and 2 held, rechecked the same day.
+
 RFC 9180 HPKE base mode is written in `ohttp/crypto.py` on `cryptography`'s X25519, `HKDFExpand`,
 `AESGCM` and `ChaCha20Poly1305`. `cryptography` 47.0.0 (2026-04-24) added
 `cryptography.hazmat.primitives.hpke` (documented at

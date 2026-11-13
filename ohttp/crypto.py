@@ -7,9 +7,16 @@ response, and Appendix A can be checked only with a caller-chosen ephemeral key.
 schedule here is written out from RFC 9180 sec. 4, sec. 5.1 and sec. 5.3, and takes from
 ``cryptography`` only X25519, HKDF-Expand and the AEADs.
 
-Implemented: mode_base, DHKEM(X25519, HKDF-SHA256) (kem 0x0020), HKDF-SHA256/384/512 (kdf
-0x0001..0x0003), AES-128-GCM, AES-256-GCM and ChaCha20Poly1305 (aead 0x0001..0x0003). The P-256,
-P-384, P-521 and X448 KEMs, and the PSK and Auth modes, are not.
+Implemented: mode_base, DHKEM(X25519, HKDF-SHA256) (kem 0x0020) and DHKEM(P-256, HKDF-SHA256)
+(kem 0x0010, RFC 9180 appendix A.3 vectors), HKDF-SHA256/384/512 (kdf 0x0001..0x0003),
+AES-128-GCM, AES-256-GCM and ChaCha20Poly1305 (aead 0x0001..0x0003). The P-384, P-521 and X448
+KEMs, and the PSK and Auth modes, are not.
+
+P-256 follows RFC 9180 sec. 7.1: public keys are the uncompressed SEC1 point (65 octets;
+compressed or malformed points are refused, which is the partial validation of sec. 7.1.4),
+private keys are the 32-octet big-endian scalar and must lie in [1, order-1], and the
+Diffie-Hellman output is the x coordinate. The scalar is not reduced as sec. 7.1.2 allows;
+a value outside the range is refused instead, so two implementations cannot disagree on it.
 """
 
 from __future__ import annotations
@@ -21,7 +28,8 @@ from dataclasses import dataclass, field
 from typing import cast
 
 from cryptography.exceptions import InvalidTag
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
@@ -31,6 +39,8 @@ from .errors import MessageError
 __all__ = [
     "AEADS",
     "KDFS",
+    "KEMS",
+    "KEM_P256",
     "KEM_X25519",
     "HpkeSuite",
     "ReceiverContext",
@@ -45,6 +55,7 @@ __all__ = [
 ]
 
 KEM_X25519 = 0x0020
+KEM_P256 = 0x0010
 _MODE_BASE = b"\x00"  # RFC 9180 sec. 5 Table 1
 
 
@@ -54,6 +65,18 @@ class _Kdf:
     algorithm: type[hashes.HashAlgorithm]
     nh: int
 
+
+@dataclass(frozen=True)
+class _Kem:
+    """One row of RFC 9180 sec. 7.1 Table 2 (the KEM's own KDF is always HKDF-SHA256 here)."""
+
+    nsecret: int
+    nenc: int
+    npk: int
+    nsk: int
+
+
+KEMS: dict[int, _Kem] = {KEM_X25519: _Kem(32, 32, 32, 32), KEM_P256: _Kem(32, 65, 65, 32)}
 
 # RFC 9180 sec. 7.2 Table 3.
 KDFS: dict[int, _Kdf] = {
@@ -84,11 +107,11 @@ class HpkeSuite:
 
 def supported_suites() -> tuple[HpkeSuite, ...]:
     """The HPKE ciphersuites this module implements, RFC 9180 sec. 7 and RFC 9458 sec. 3.1."""
-    return tuple(HpkeSuite(KEM_X25519, kdf, aead) for kdf in KDFS for aead in AEADS)
+    return tuple(HpkeSuite(kem, kdf, aead) for kem in KEMS for kdf in KDFS for aead in AEADS)
 
 
 def _check(suite: HpkeSuite) -> None:
-    if suite.kem_id != KEM_X25519 or suite.kdf_id not in KDFS or suite.aead_id not in AEADS:
+    if suite.kem_id not in KEMS or suite.kdf_id not in KDFS or suite.aead_id not in AEADS:
         raise MessageError("unsupported HPKE ciphersuite")
 
 
@@ -104,18 +127,49 @@ def _clamp(sk: bytes) -> bytes:
 
 
 def generate_keypair(kem_id: int = KEM_X25519) -> tuple[bytes, bytes]:
-    """Return ``(private, public)`` for the KEM, the private key serialised clamped."""
-    if kem_id != KEM_X25519:
-        raise NotImplementedError(f"KEM {kem_id:#06x}: only DHKEM(X25519, HKDF-SHA256) exists")
-    private = _clamp(os.urandom(32))
-    return private, _public(private)
+    """Return ``(private, public)`` for the KEM, the private key serialised as RFC 9180 says."""
+    if kem_id == KEM_X25519:
+        private = _clamp(os.urandom(32))
+    elif kem_id == KEM_P256:
+        key = ec.generate_private_key(ec.SECP256R1())
+        private = key.private_numbers().private_value.to_bytes(32, "big")
+    else:
+        raise NotImplementedError(f"KEM {kem_id:#06x} is not implemented")
+    return private, _public(kem_id, private)
 
 
-def _public(private: bytes) -> bytes:
+def _p256_private(private: bytes) -> ec.EllipticCurvePrivateKey:
+    if len(private) != 32:
+        raise MessageError("a P-256 private key is 32 bytes")
+    try:
+        return ec.derive_private_key(int.from_bytes(private, "big"), ec.SECP256R1())
+    except ValueError:
+        raise MessageError("P-256 private key is outside [1, order-1]") from None
+
+
+def _p256_public(public: bytes) -> ec.EllipticCurvePublicKey:
+    # RFC 9180 sec. 7.1.1: uncompressed only; sec. 7.1.4: on the curve, not the point at infinity.
+    if len(public) != 65 or public[0] != 4:
+        raise MessageError("a P-256 public key is a 65-byte uncompressed point")
+    try:
+        return ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), public)
+    except ValueError:
+        raise MessageError("P-256 public key is not a point on the curve") from None
+
+
+def _public(kem_id: int, private: bytes) -> bytes:
+    if kem_id == KEM_P256:
+        return (
+            _p256_private(private)
+            .public_key()
+            .public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
+        )
     return X25519PrivateKey.from_private_bytes(private).public_key().public_bytes_raw()
 
 
-def _dh(private: bytes, public: bytes) -> bytes:
+def _dh(kem_id: int, private: bytes, public: bytes) -> bytes:
+    if kem_id == KEM_P256:
+        return _p256_private(private).exchange(ec.ECDH(), _p256_public(public))
     if len(public) != 32:
         raise MessageError("an X25519 public key is 32 bytes")
     try:
@@ -166,11 +220,13 @@ def _labeled_expand(
     return _expand(kdf, prk, labeled, length)
 
 
-def _kem_shared_secret(dh: bytes, kem_context: bytes) -> bytes:
-    kdf = KDFS[0x0001]  # DHKEM(X25519, HKDF-SHA256)
-    suite_id = b"KEM" + KEM_X25519.to_bytes(2, "big")
+def _kem_shared_secret(kem_id: int, dh: bytes, kem_context: bytes) -> bytes:
+    kdf = KDFS[0x0001]  # both implemented KEMs use HKDF-SHA256
+    suite_id = b"KEM" + kem_id.to_bytes(2, "big")
     eae_prk = _labeled_extract(kdf, suite_id, b"", b"eae_prk", dh)
-    return _labeled_expand(kdf, suite_id, eae_prk, b"shared_secret", kem_context, 32)
+    return _labeled_expand(
+        kdf, suite_id, eae_prk, b"shared_secret", kem_context, KEMS[kem_id].nsecret
+    )
 
 
 @dataclass
@@ -256,16 +312,16 @@ def setup_base_s(
     """
     _check(suite)
     if ephemeral_sk is None:
-        ephemeral_sk = _clamp(os.urandom(32))
-    enc = _public(ephemeral_sk)
-    dh = _dh(ephemeral_sk, public_key)
-    shared = _kem_shared_secret(dh, enc + public_key)
+        ephemeral_sk = generate_keypair(suite.kem_id)[0]
+    enc = _public(suite.kem_id, ephemeral_sk)
+    dh = _dh(suite.kem_id, ephemeral_sk, public_key)
+    shared = _kem_shared_secret(suite.kem_id, dh, enc + public_key)
     return enc, cast(SenderContext, _key_schedule(SenderContext, suite, shared, info))
 
 
 def setup_base_r(suite: HpkeSuite, enc: bytes, private_key: bytes, info: bytes) -> ReceiverContext:
     """SetupBaseR (RFC 9180 sec. 5.1.1)."""
     _check(suite)
-    dh = _dh(private_key, enc)
-    shared = _kem_shared_secret(dh, enc + _public(private_key))
+    dh = _dh(suite.kem_id, private_key, enc)
+    shared = _kem_shared_secret(suite.kem_id, dh, enc + _public(suite.kem_id, private_key))
     return cast(ReceiverContext, _key_schedule(ReceiverContext, suite, shared, info))

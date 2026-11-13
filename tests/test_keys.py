@@ -102,7 +102,10 @@ def test_generate_config():
     assert pair.private_key[0] & 7 == 0
     assert pair.private_key[31] & 0xC0 == 0x40  # clamped (RFC 9180 sec. 7.1.2, erratum 7121)
     with pytest.raises(NotImplementedError):
-        generate_config(suites, 1, kem_id=0x0010)
+        generate_config(suites, 1, kem_id=0x0011)  # P-384 is not implemented
+    p256 = generate_config(suites, 1, kem_id=0x0010)
+    assert len(p256.config.public_key) == 65
+    assert p256.config.public_key[0] == 4
 
 
 @given(
@@ -120,3 +123,59 @@ def test_roundtrip_property(key_id, kem, data, suites):
     key = data.draw(st.binary(min_size=size, max_size=size))
     config = KeyConfig(key_id, kem, key, tuple(suites))
     assert parse_config(encode_config(config)) == config
+
+
+def test_rotation_listener():
+    from ohttp.errors import KeyConfigError
+    from ohttp.keys import KeyRing, parse_config_list
+
+    suites = (SymmetricSuite(1, 1),)
+    events = []
+    ring = KeyRing(grace=100.0)
+    unsubscribe = ring.subscribe(events.append)
+    first = generate_config(suites, ring.next_key_id())
+    ring.add(first, 0.0)
+    assert [c.key_id for c in parse_config_list(ring.config_list())] == [first.config.key_id]
+    second = generate_config(suites, ring.next_key_id())
+    assert second.config.key_id != first.config.key_id  # identifiers are not reused (sec. 6.4)
+    ring.rotate(second, 10.0)
+    # only the new key is published; the old one still opens requests for the grace period
+    assert [p.config.key_id for p in ring.current()] == [second.config.key_id]
+    assert [c.key_id for c in parse_config_list(ring.config_list())] == [second.config.key_id]
+    assert {p.config.key_id for p in ring.decapsulation_keys(50.0)} == {
+        first.config.key_id,
+        second.config.key_id,
+    }
+    assert {p.config.key_id for p in ring.decapsulation_keys(110.0)} == {second.config.key_id}
+    # sec. 6.6: the old key is deleted after the period, and the caller is told which
+    assert ring.expire(50.0) == []
+    assert ring.expire(110.0) == [first]
+    assert ring.expire(200.0) == []
+    assert [(e.kind, e.key_id, e.at) for e in events] == [
+        ("added", first.config.key_id, 0.0),
+        ("added", second.config.key_id, 10.0),
+        ("retired", first.config.key_id, 10.0),
+        ("expired", first.config.key_id, 110.0),
+    ]
+    unsubscribe()
+    ring.add(generate_config(suites, ring.next_key_id()), 300.0)
+    assert len(events) == 4  # no longer listening
+    with pytest.raises(KeyConfigError, match="in use"):
+        ring.add(second, 301.0)
+    with pytest.raises(ValueError, match="negative"):
+        KeyRing(grace=-1)
+
+
+def test_rotation_key_identifiers_wrap_and_exhaust():
+    from ohttp.errors import KeyConfigError
+    from ohttp.keys import KeyRing
+
+    suites = (SymmetricSuite(1, 1),)
+    ring = KeyRing()
+    ring.add(generate_config(suites, 255), 0.0)
+    assert ring.next_key_id() == 0  # wraps past 255
+    for key_id in range(256):
+        if key_id != 255:
+            ring.add(generate_config(suites, key_id), 1.0)
+    with pytest.raises(KeyConfigError, match="256"):
+        ring.next_key_id()

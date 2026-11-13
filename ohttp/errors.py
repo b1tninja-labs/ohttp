@@ -11,6 +11,7 @@ __all__ = [
     "KeyConfigError",
     "MessageError",
     "OhttpError",
+    "UnknownKeyError",
 ]
 
 
@@ -28,3 +29,7 @@ class BhttpError(OhttpError):
 
 class MessageError(OhttpError):
     """An encapsulated request or response could not be built or opened (RFC 9458 sec. 4)."""
+
+
+class UnknownKeyError(MessageError):
+    """No key matches the request's key identifier (RFC 9458 sec. 6.4: unknown or replaced)."""
