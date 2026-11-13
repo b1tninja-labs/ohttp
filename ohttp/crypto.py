@@ -1,21 +1,271 @@
-"""the HPKE seam, swappable and pinned to tested suites (RFC 9180).
+"""HPKE base mode (RFC 9180) built on the ``cryptography`` primitives.
 
-Every object in this module is a placeholder until the milestone named in ROADMAP.md lands. A
-stub raises instead of returning a plausible empty value: a protocol library that silently
-answers nothing is worse than one that refuses to answer.
+``cryptography`` 47 and later ship ``cryptography.hazmat.primitives.hpke``, but only as the
+single-shot ``Suite.encrypt`` and ``Suite.decrypt``: it draws a fresh ephemeral key inside
+``encrypt`` and has no ``Export``. RFC 9458 sec. 4.4 needs ``context.Export`` to protect the
+response, and Appendix A can be checked only with a caller-chosen ephemeral key. So the key
+schedule here is written out from RFC 9180 sec. 4, sec. 5.1 and sec. 5.3, and takes from
+``cryptography`` only X25519, HKDF-Expand and the AEADs.
+
+Implemented: mode_base, DHKEM(X25519, HKDF-SHA256) (kem 0x0020), HKDF-SHA256/384/512 (kdf
+0x0001..0x0003), AES-128-GCM, AES-256-GCM and ChaCha20Poly1305 (aead 0x0001..0x0003). The P-256,
+P-384, P-521 and X448 KEMs, and the PSK and Auth modes, are not.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import os
+from dataclasses import dataclass, field
+from typing import cast
+
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
+from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
+
+from .errors import MessageError
+
 __all__ = [
+    "AEADS",
+    "KDFS",
+    "KEM_X25519",
+    "HpkeSuite",
+    "ReceiverContext",
+    "SenderContext",
+    "aead_for",
+    "generate_keypair",
+    "kdf_expand",
+    "kdf_extract",
+    "setup_base_r",
+    "setup_base_s",
     "supported_suites",
 ]
 
+KEM_X25519 = 0x0020
+_MODE_BASE = b"\x00"  # RFC 9180 sec. 5 Table 1
 
-def supported_suites() -> tuple:
-    """Pending behaviour defined by RFC 9180 sec. 7.
 
-    Not implemented yet. See the ``crypto.supported_suites()`` row in ROADMAP.md; this
-    stub raises on purpose so nothing downstream mistakes it for working code.
+@dataclass(frozen=True)
+class _Kdf:
+    hash_name: str
+    algorithm: type[hashes.HashAlgorithm]
+    nh: int
+
+
+# RFC 9180 sec. 7.2 Table 3.
+KDFS: dict[int, _Kdf] = {
+    0x0001: _Kdf("sha256", hashes.SHA256, 32),
+    0x0002: _Kdf("sha384", hashes.SHA384, 48),
+    0x0003: _Kdf("sha512", hashes.SHA512, 64),
+}
+
+
+@dataclass(frozen=True)
+class _Aead:
+    nk: int
+    nn: int
+
+
+# RFC 9180 sec. 7.3 Table 5 (0xFFFF export-only is not offered).
+AEADS: dict[int, _Aead] = {0x0001: _Aead(16, 12), 0x0002: _Aead(32, 12), 0x0003: _Aead(32, 12)}
+
+
+@dataclass(frozen=True)
+class HpkeSuite:
+    """A (KEM, KDF, AEAD) triple of RFC 9180 sec. 4 identifiers."""
+
+    kem_id: int
+    kdf_id: int
+    aead_id: int
+
+
+def supported_suites() -> tuple[HpkeSuite, ...]:
+    """The HPKE ciphersuites this module implements, RFC 9180 sec. 7 and RFC 9458 sec. 3.1."""
+    return tuple(HpkeSuite(KEM_X25519, kdf, aead) for kdf in KDFS for aead in AEADS)
+
+
+def _check(suite: HpkeSuite) -> None:
+    if suite.kem_id != KEM_X25519 or suite.kdf_id not in KDFS or suite.aead_id not in AEADS:
+        raise MessageError("unsupported HPKE ciphersuite")
+
+
+def _clamp(sk: bytes) -> bytes:
+    """RFC 7748 decodeScalar25519 bit operations, which RFC 9180 sec. 7.1.2 requires."""
+    if len(sk) != 32:
+        raise MessageError("an X25519 private key is 32 bytes")
+    b = bytearray(sk)
+    b[0] &= 248
+    b[31] &= 127
+    b[31] |= 64
+    return bytes(b)
+
+
+def generate_keypair(kem_id: int = KEM_X25519) -> tuple[bytes, bytes]:
+    """Return ``(private, public)`` for the KEM, the private key serialised clamped."""
+    if kem_id != KEM_X25519:
+        raise NotImplementedError(f"KEM {kem_id:#06x}: only DHKEM(X25519, HKDF-SHA256) exists")
+    private = _clamp(os.urandom(32))
+    return private, _public(private)
+
+
+def _public(private: bytes) -> bytes:
+    return X25519PrivateKey.from_private_bytes(private).public_key().public_bytes_raw()
+
+
+def _dh(private: bytes, public: bytes) -> bytes:
+    if len(public) != 32:
+        raise MessageError("an X25519 public key is 32 bytes")
+    try:
+        shared = X25519PrivateKey.from_private_bytes(private).exchange(
+            X25519PublicKey.from_public_bytes(public)
+        )
+    except ValueError:
+        raise MessageError("X25519 key exchange failed") from None
+    if not any(shared):  # RFC 9180 sec. 7.1.4: abort on the all-zero shared secret
+        raise MessageError("X25519 shared secret is all zero")
+    return shared
+
+
+def _extract(hash_name: str, salt: bytes, ikm: bytes) -> bytes:
+    # HKDF-Extract is HMAC(salt, ikm) (RFC 5869 sec. 2.2); an empty salt is a string of zeros,
+    # which HMAC's key padding already is. cryptography exposes only the combined HKDF, so
+    # Extract is the standard library's.
+    return hmac.new(salt, ikm, getattr(hashlib, hash_name)).digest()
+
+
+def _expand(kdf: _Kdf, prk: bytes, info: bytes, length: int) -> bytes:
+    return HKDFExpand(kdf.algorithm(), length, info).derive(prk)
+
+
+def kdf_extract(suite: HpkeSuite, salt: bytes, ikm: bytes) -> bytes:
+    """The HPKE ciphersuite KDF's ``Extract(salt, ikm)`` (RFC 9180 sec. 4)."""
+    return _extract(KDFS[suite.kdf_id].hash_name, salt, ikm)
+
+
+def kdf_expand(suite: HpkeSuite, prk: bytes, info: bytes, length: int) -> bytes:
+    """The HPKE ciphersuite KDF's ``Expand(prk, info, L)`` (RFC 9180 sec. 4)."""
+    return _expand(KDFS[suite.kdf_id], prk, info, length)
+
+
+def aead_for(suite: HpkeSuite, key: bytes) -> AESGCM | ChaCha20Poly1305:
+    """The suite's AEAD keyed with ``key`` (RFC 9180 sec. 7.3)."""
+    return ChaCha20Poly1305(key) if suite.aead_id == 0x0003 else AESGCM(key)
+
+
+def _labeled_extract(kdf: _Kdf, suite_id: bytes, salt: bytes, label: bytes, ikm: bytes) -> bytes:
+    return _extract(kdf.hash_name, salt, b"HPKE-v1" + suite_id + label + ikm)
+
+
+def _labeled_expand(
+    kdf: _Kdf, suite_id: bytes, prk: bytes, label: bytes, info: bytes, length: int
+) -> bytes:
+    labeled = length.to_bytes(2, "big") + b"HPKE-v1" + suite_id + label + info
+    return _expand(kdf, prk, labeled, length)
+
+
+def _kem_shared_secret(dh: bytes, kem_context: bytes) -> bytes:
+    kdf = KDFS[0x0001]  # DHKEM(X25519, HKDF-SHA256)
+    suite_id = b"KEM" + KEM_X25519.to_bytes(2, "big")
+    eae_prk = _labeled_extract(kdf, suite_id, b"", b"eae_prk", dh)
+    return _labeled_expand(kdf, suite_id, eae_prk, b"shared_secret", kem_context, 32)
+
+
+@dataclass
+class _Context:
+    suite: HpkeSuite
+    _key: bytes = field(repr=False)
+    _base_nonce: bytes = field(repr=False)
+    _exporter_secret: bytes = field(repr=False)
+    _suite_id: bytes = field(repr=False)
+    seq: int = 0
+
+    def _aead(self) -> AESGCM | ChaCha20Poly1305:
+        return aead_for(self.suite, self._key)
+
+    def _nonce(self) -> bytes:
+        # RFC 9180 sec. 5.2 ComputeNonce: base_nonce XOR I2OSP(seq, Nn); overflow is an error.
+        nn = len(self._base_nonce)
+        if self.seq >= (1 << (8 * nn)) - 1:
+            raise MessageError("HPKE message limit reached")
+        return bytes(
+            a ^ b for a, b in zip(self._base_nonce, self.seq.to_bytes(nn, "big"), strict=True)
+        )
+
+    def export(self, exporter_context: bytes, length: int) -> bytes:
+        """``Context.Export`` (RFC 9180 sec. 5.3), usable by either role."""
+        kdf = KDFS[self.suite.kdf_id]
+        if length > 255 * kdf.nh:
+            raise MessageError("export length exceeds 255*Nh")
+        return _labeled_expand(
+            kdf, self._suite_id, self._exporter_secret, b"sec", exporter_context, length
+        )
+
+
+class SenderContext(_Context):
+    """The sending context of SetupBaseS; it may seal and must not open (RFC 9180 sec. 5.2)."""
+
+    def seal(self, aad: bytes, plaintext: bytes) -> bytes:
+        """ContextS.Seal."""
+        ciphertext = self._aead().encrypt(self._nonce(), plaintext, aad)
+        self.seq += 1
+        return ciphertext
+
+
+class ReceiverContext(_Context):
+    """The receiving context of SetupBaseR; it may open and must not seal (RFC 9180 sec. 5.2)."""
+
+    def open(self, aad: bytes, ciphertext: bytes) -> bytes:
+        """ContextR.Open; raises ``MessageError`` on any authentication failure."""
+        try:
+            plaintext = self._aead().decrypt(self._nonce(), ciphertext, aad)
+        except InvalidTag:
+            raise MessageError("HPKE decryption failed") from None
+        self.seq += 1
+        return plaintext
+
+
+def _key_schedule(
+    cls: type[_Context], suite: HpkeSuite, shared_secret: bytes, info: bytes
+) -> _Context:
+    kdf, aead = KDFS[suite.kdf_id], AEADS[suite.aead_id]
+    suite_id = (
+        b"HPKE"
+        + suite.kem_id.to_bytes(2, "big")
+        + suite.kdf_id.to_bytes(2, "big")
+        + suite.aead_id.to_bytes(2, "big")
+    )
+    psk_id_hash = _labeled_extract(kdf, suite_id, b"", b"psk_id_hash", b"")
+    info_hash = _labeled_extract(kdf, suite_id, b"", b"info_hash", info)
+    context = _MODE_BASE + psk_id_hash + info_hash
+    secret = _labeled_extract(kdf, suite_id, shared_secret, b"secret", b"")
+    key = _labeled_expand(kdf, suite_id, secret, b"key", context, aead.nk)
+    nonce = _labeled_expand(kdf, suite_id, secret, b"base_nonce", context, aead.nn)
+    exporter = _labeled_expand(kdf, suite_id, secret, b"exp", context, kdf.nh)
+    return cls(suite, key, nonce, exporter, suite_id)
+
+
+def setup_base_s(
+    suite: HpkeSuite, public_key: bytes, info: bytes, *, ephemeral_sk: bytes | None = None
+) -> tuple[bytes, SenderContext]:
+    """SetupBaseS (RFC 9180 sec. 5.1.1): return ``(enc, context)``.
+
+    ``ephemeral_sk`` exists so Appendix A of RFC 9458 can be reproduced; leave it out otherwise.
     """
-    raise NotImplementedError("supported_suites() is not implemented: RFC 9180 sec. 7")
+    _check(suite)
+    if ephemeral_sk is None:
+        ephemeral_sk = _clamp(os.urandom(32))
+    enc = _public(ephemeral_sk)
+    dh = _dh(ephemeral_sk, public_key)
+    shared = _kem_shared_secret(dh, enc + public_key)
+    return enc, cast(SenderContext, _key_schedule(SenderContext, suite, shared, info))
+
+
+def setup_base_r(suite: HpkeSuite, enc: bytes, private_key: bytes, info: bytes) -> ReceiverContext:
+    """SetupBaseR (RFC 9180 sec. 5.1.1)."""
+    _check(suite)
+    dh = _dh(private_key, enc)
+    shared = _kem_shared_secret(dh, enc + _public(private_key))
+    return cast(ReceiverContext, _key_schedule(ReceiverContext, suite, shared, info))

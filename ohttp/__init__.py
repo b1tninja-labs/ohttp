@@ -6,7 +6,7 @@ relays never sees the content.
 
 from __future__ import annotations
 
-from . import apps, cli, client, crypto, gateway, keys, message, responder, svcb
+from . import apps, bhttp, cli, client, crypto, errors, gateway, keys, message, responder, svcb
 from .client import request
 from .crypto import supported_suites
 from .gateway import relay
@@ -19,11 +19,13 @@ __version__ = "0.1.0"
 __all__ = [
     "__version__",
     "apps",
+    "bhttp",
     "cli",
     "client",
     "crypto",
     "decapsulate",
     "encapsulate",
+    "errors",
     "gateway",
     "generate_config",
     "keys",

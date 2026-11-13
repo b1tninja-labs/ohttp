@@ -12,14 +12,19 @@ other way round.
 
 ## Position
 
-**Tier 3, wave 3** - the routing-operations story. Tier 3 is planned: a solid gap with no
-urgency, and better work once Tier 1 exists.
+**Tier 3, wave 5** - the rest, in tier order, one at a time (PORTFOLIO.md section 7; the wave 3
+label this file carried was the generator naming the routing-operations wave, which does not
+contain this project). Tier 3 is planned: a solid gap with no urgency, and better work once
+Tier 1 exists.
 
 ## Depends on
 
-None. The portfolio plan puts no other project between this one and a first release: every
+No sibling project. The portfolio plan puts no other project between this one and a first release: every
 obligation in [../ROADMAP.md](../ROADMAP.md) is this repository's own, and nothing outside it
-has to land first. That cuts both ways - a missing dependency is never the reason this project
+has to land first. The one external dependency is the `cryptography` package, for X25519,
+HKDF-Expand, AES-GCM and ChaCha20-Poly1305 only (the owner's rule of 2026-11-13: primitives from `cryptography`,
+everything else ours). RFC 9540 discovery takes `namespy`'s SVCB records as a structural input,
+not an import. That cuts both ways - a missing dependency is never the reason this project
 has not shipped, and its wave position is the only thing holding it back.
 
 ## Sequencing rules

@@ -54,9 +54,11 @@ rather than merely incomplete.
 3. **Normative text is never paraphrased from memory.** Fetch it with `rfclib` and
    cite the section. If the text you fetch does not say what the obligation claims,
    the obligation is wrong: fix the roadmap row and say so in the commit.
-4. **Dependencies.** `pyproject.toml` here declares no runtime dependencies. Adding a runtime
-   dependency needs a paragraph of justification in `docs/strategy.md` explaining
-   why the standard library is not enough.
+4. **Dependencies.** The one runtime dependency is `cryptography`, for primitives only: X25519,
+   HKDF-Expand, AES-GCM, ChaCha20-Poly1305 (owner rule: everything else is ours, including HPKE's
+   key schedule, Binary HTTP and every wire format). Adding another runtime dependency needs a
+   paragraph of justification in `docs/strategy.md` explaining why the standard library and
+   `cryptography` are not enough.
 5. **Scope.** What is deliberately absent is listed under Non-goals in `README.md`.
    An agent that "helpfully" implements a non-goal has expanded the API surface that
    has to be supported forever.

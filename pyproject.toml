@@ -31,8 +31,9 @@ classifiers = [
   "Typing :: Typed",
 ]
 # Empty unless a module cannot be honest without it. Every entry needs a sentence in
-# README.md explaining why the zero-dependency rule was broken for it.
-dependencies = []
+# README.md explaining why the zero-dependency rule was broken for it. cryptography supplies
+# X25519, HKDF-Expand, AES-GCM and ChaCha20-Poly1305 only; see docs/strategy.md.
+dependencies = ["cryptography>=42"]
 
 [project.optional-dependencies]
 dev = [
@@ -46,7 +47,6 @@ dev = [
   # first being able to build one, so the build dependency belongs in the dev group.
   "build",
 ]
-hpke = ["hpke>0.3.2"]
 dns = ["namespy>0.9"]
 
 [project.urls]
